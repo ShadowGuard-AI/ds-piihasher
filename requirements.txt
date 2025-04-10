@@ -1,0 +1,6 @@
+```
+bcrypt>=4.1.2
+faker>=20.5.0
+pandas>=2.2.1
+presidio_analyzer>=2.2.4
+```
