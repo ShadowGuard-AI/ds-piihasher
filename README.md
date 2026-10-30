@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # ds-PIIHasher
 A command-line tool that replaces identified Personally Identifiable Information (PII) with consistent, reversible hash values, using libraries like `presidio_analyzer` for PII detection and `bcrypt` for secure hashing. - Focused on Data anonymization and pseudonymization toolkit.  Provides utilities to redact or replace sensitive information within various data formats (CSV, JSON, text files) with realistic, synthetic data. Useful for preparing data for testing or sharing without exposing real user information.
 
