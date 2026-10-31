@@ -3,6 +3,9 @@ import logging
 import os
 import json
 import csv
+import sys
+import hashlib
+import hmac
 import pandas as pd
 import bcrypt
 from faker import Faker
@@ -13,6 +16,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Initialize Faker for synthetic data generation
 fake = Faker()
+UNPROCESSED_COUNT = 0
 
 def setup_argparse():
     """
@@ -24,9 +28,11 @@ def setup_argparse():
     parser.add_argument('--file_type', type=str, choices=['csv', 'json', 'txt'], help='Specify the file type explicitly (csv, json, txt).  If not specified, the script attempts to infer based on the file extension.')
     parser.add_argument('--fields', type=str, nargs='+', help='List of fields (columns) to anonymize (for CSV and JSON). If not specified, all fields will be checked.')
     parser.add_argument('--pii_types', type=str, nargs='+', default=['EMAIL_ADDRESS', 'PHONE_NUMBER', 'CREDIT_CARD', 'PERSON', 'IBAN_CODE', 'US_SSN'], help='List of PII types to detect (default: EMAIL_ADDRESS, PHONE_NUMBER, CREDIT_CARD, PERSON, IBAN_CODE, US_SSN).  See Presidio documentation for full list of supported types.')
-    parser.add_argument('--hash', action='store_true', help='Enable reversible hashing of PII using bcrypt.')
+    parser.add_argument('--hash', action='store_true', help='Hash PII with bcrypt. This mode is salted, one way, and not consistent: the same value gives a different hash on each occurrence.')
+    parser.add_argument('--keyed-hash', action='store_true', help='Hash PII with a keyed HMAC-SHA256 hash. This mode is consistent for anyone holding the key: the same value gives the same output. It is one way and not reversible.')
+    parser.add_argument('--hash-key', type=str, default=None, help='Key for --keyed-hash. If not given, the DS_PIIHASHER_KEY environment variable is used.')
     parser.add_argument('--replace', action='store_true', help='Enable PII replacement with synthetic data.')
-    parser.add_argument('--seed', type=int, help='Optional seed for the Faker instance to generate consistent synthetic data across multiple runs.')
+    parser.add_argument('--seed', type=int, help='Seed for the Faker instance, so a --replace run with the same seed produces the same synthetic data.')
 
 
     return parser.parse_args()
@@ -69,6 +75,10 @@ def hash_pii(text):
         logging.error(f"Error during hashing: {e}")
         return None
 
+def keyed_hash_pii(text, key):
+    digest = hmac.new(key.encode('utf-8'), text.encode('utf-8'), hashlib.sha256).hexdigest()
+    return 'hmac-sha256:' + digest
+
 def replace_pii(pii_type):
     """
     Replaces PII with synthetic data using Faker.
@@ -100,7 +110,7 @@ def replace_pii(pii_type):
         return None
 
 
-def anonymize_text(text, pii_types, hash_pii_flag, replace_pii_flag):
+def anonymize_text(text, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_flag=False, hash_key=None):
     """
     Anonymizes the given text by either hashing or replacing detected PII.
 
@@ -113,6 +123,7 @@ def anonymize_text(text, pii_types, hash_pii_flag, replace_pii_flag):
     Returns:
         str: The anonymized text.
     """
+    global UNPROCESSED_COUNT
     results = detect_pii(text, pii_types)
     anonymized_text = text
 
@@ -120,13 +131,21 @@ def anonymize_text(text, pii_types, hash_pii_flag, replace_pii_flag):
     results = sorted(results, key=lambda x: x.start, reverse=True)
 
     for res in results:
+        if res.score < 0.8:
+            UNPROCESSED_COUNT += 1
+            logging.warning(f"Skipped detection below the 0.8 threshold: type {res.entity_type}, score {res.score}. Value left unprocessed.")
+            continue
         if res.score >= 0.8: # Only process if confidence score is high
             start = res.start
             end = res.end
             pii_entity = text[start:end]
             pii_type = res.entity_type
 
-            if hash_pii_flag:
+            if keyed_hash_flag:
+                hashed_value = keyed_hash_pii(pii_entity, hash_key)
+                anonymized_text = anonymized_text[:start] + hashed_value + anonymized_text[end:]
+
+            elif hash_pii_flag:
                 hashed_value = hash_pii(pii_entity)
                 if hashed_value:
                     anonymized_text = anonymized_text[:start] + hashed_value + anonymized_text[end:]
@@ -140,12 +159,13 @@ def anonymize_text(text, pii_types, hash_pii_flag, replace_pii_flag):
                 else:
                     logging.warning(f"Failed to replace PII entity: {pii_entity} (type: {pii_type})")
             else:
+                  UNPROCESSED_COUNT += 1
                   logging.warning("Neither hashing nor replacement enabled for PII entity.")
 
     return anonymized_text
 
 
-def process_csv(input_file, output_file, fields, pii_types, hash_pii_flag, replace_pii_flag):
+def process_csv(input_file, output_file, fields, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_flag=False, hash_key=None):
     """
     Processes a CSV file, anonymizing the specified fields.
 
@@ -164,7 +184,7 @@ def process_csv(input_file, output_file, fields, pii_types, hash_pii_flag, repla
 
         for field in fields:
             if field in df.columns:
-                df[field] = df[field].astype(str).apply(lambda x: anonymize_text(x, pii_types, hash_pii_flag, replace_pii_flag))
+                df[field] = df[field].astype(str).apply(lambda x: anonymize_text(x, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_flag, hash_key))
             else:
                 logging.warning(f"Field '{field}' not found in CSV. Skipping.")
 
@@ -173,13 +193,16 @@ def process_csv(input_file, output_file, fields, pii_types, hash_pii_flag, repla
 
     except FileNotFoundError:
         logging.error(f"Input file not found: {input_file}")
+        raise
     except pd.errors.EmptyDataError:
         logging.error(f"Input CSV file is empty: {input_file}")
+        raise
     except Exception as e:
         logging.error(f"Error processing CSV file: {e}")
+        raise
 
 
-def process_json(input_file, output_file, fields, pii_types, hash_pii_flag, replace_pii_flag):
+def process_json(input_file, output_file, fields, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_flag=False, hash_key=None):
     """
     Processes a JSON file, anonymizing the specified fields.
 
@@ -195,19 +218,19 @@ def process_json(input_file, output_file, fields, pii_types, hash_pii_flag, repl
         with open(input_file, 'r') as f:
             data = json.load(f)
 
-        def anonymize_recursively(obj):
+        def anonymize_recursively(obj, parent_key=None):
             if isinstance(obj, dict):
-                for key, value in obj.items():
-                    if fields is None or key in fields:
-                        if isinstance(value, str):
-                            obj[key] = anonymize_text(value, pii_types, hash_pii_flag, replace_pii_flag)
-                        else:
-                            anonymize_recursively(value)  # Recurse for nested objects/lists
+                return {key: anonymize_recursively(value, key) for key, value in obj.items()}
             elif isinstance(obj, list):
-                for item in obj:
-                    anonymize_recursively(item)
+                return [anonymize_recursively(item, parent_key) for item in obj]
+            elif isinstance(obj, str):
+                if fields is None or parent_key in fields:
+                    return anonymize_text(obj, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_flag, hash_key)
+                return obj
+            else:
+                return obj
 
-        anonymize_recursively(data)
+        data = anonymize_recursively(data)
 
         with open(output_file, 'w') as f:
             json.dump(data, f, indent=4)
@@ -216,13 +239,16 @@ def process_json(input_file, output_file, fields, pii_types, hash_pii_flag, repl
 
     except FileNotFoundError:
         logging.error(f"Input file not found: {input_file}")
+        raise
     except json.JSONDecodeError:
         logging.error(f"Invalid JSON format in file: {input_file}")
+        raise
     except Exception as e:
         logging.error(f"Error processing JSON file: {e}")
+        raise
 
 
-def process_txt(input_file, output_file, pii_types, hash_pii_flag, replace_pii_flag):
+def process_txt(input_file, output_file, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_flag=False, hash_key=None):
     """
     Processes a TXT file, anonymizing the entire content.
 
@@ -237,7 +263,7 @@ def process_txt(input_file, output_file, pii_types, hash_pii_flag, replace_pii_f
         with open(input_file, 'r') as f:
             text = f.read()
 
-        anonymized_text = anonymize_text(text, pii_types, hash_pii_flag, replace_pii_flag)
+        anonymized_text = anonymize_text(text, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_flag, hash_key)
 
         with open(output_file, 'w') as f:
             f.write(anonymized_text)
@@ -246,8 +272,10 @@ def process_txt(input_file, output_file, pii_types, hash_pii_flag, replace_pii_f
 
     except FileNotFoundError:
         logging.error(f"Input file not found: {input_file}")
+        raise
     except Exception as e:
         logging.error(f"Error processing TXT file: {e}")
+        raise
 
 
 def main():
@@ -256,33 +284,61 @@ def main():
     """
     args = setup_argparse()
 
-    # Input validation
     if not os.path.exists(args.input_file):
         logging.error(f"Input file does not exist: {args.input_file}")
-        return
+        sys.exit(1)
 
-    if args.hash and args.replace:
-        logging.error("Both --hash and --replace cannot be enabled simultaneously.  Choose one.")
-        return
+    from pathlib import Path
+    if Path(args.input_file).resolve() == Path(args.output_file).resolve():
+        logging.error("Output file must not be the input file. Choose a different output file.")
+        sys.exit(1)
 
+    modes = [bool(args.hash), bool(args.keyed_hash), bool(args.replace)]
+    if sum(modes) > 1:
+        logging.error("Only one mode can be enabled at a time. Choose one of --hash, --keyed-hash, or --replace.")
+        sys.exit(1)
+    if sum(modes) == 0:
+        logging.error("No mode was chosen. A mode must be chosen: pass --hash, --keyed-hash, or --replace.")
+        sys.exit(1)
 
-    # Determine file type
+    hash_key = None
+    if args.keyed_hash:
+        hash_key = args.hash_key or os.environ.get("DS_PIIHASHER_KEY")
+        if not hash_key:
+            logging.error("--keyed-hash needs a key: pass --hash-key or set the DS_PIIHASHER_KEY environment variable.")
+            sys.exit(1)
+
+    if args.seed is not None:
+        try:
+            Faker.seed(args.seed)
+        except Exception:
+            pass
+        try:
+            fake.seed_instance(args.seed)
+        except Exception:
+            pass
+
     if args.file_type:
         file_type = args.file_type
     else:
-        file_type = args.input_file.split('.')[-1].lower()  # Infer from extension
+        file_type = args.input_file.split('.')[-1].lower()
 
     if file_type not in ['csv', 'json', 'txt']:
         logging.error(f"Unsupported file type: {file_type}.  Please specify --file_type or use a valid file extension (csv, json, txt).")
-        return
+        sys.exit(1)
 
-    # Process based on file type
-    if file_type == 'csv':
-        process_csv(args.input_file, args.output_file, args.fields, args.pii_types, args.hash, args.replace)
-    elif file_type == 'json':
-        process_json(args.input_file, args.output_file, args.fields, args.pii_types, args.hash, args.replace)
-    elif file_type == 'txt':
-        process_txt(args.input_file, args.output_file, args.pii_types, args.hash, args.replace)
+    try:
+        if file_type == 'csv':
+            process_csv(args.input_file, args.output_file, args.fields, args.pii_types, args.hash, args.replace, args.keyed_hash, hash_key)
+        elif file_type == 'json':
+            process_json(args.input_file, args.output_file, args.fields, args.pii_types, args.hash, args.replace, args.keyed_hash, hash_key)
+        elif file_type == 'txt':
+            process_txt(args.input_file, args.output_file, args.pii_types, args.hash, args.replace, args.keyed_hash, hash_key)
+    except Exception as e:
+        logging.error(f"Processing failed: {e}")
+        sys.exit(1)
+
+    logging.info(f"Values left unprocessed: {UNPROCESSED_COUNT}")
 
 if __name__ == "__main__":
     main()
