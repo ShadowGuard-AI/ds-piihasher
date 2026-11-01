@@ -49,6 +49,14 @@ def detect_pii(text, pii_types=None):
         list: A list of Presidio RecognitionResult objects representing the detected PII entities.  Returns an empty list if no PII is found or if there's an error during analysis.
     """
 
+    # A fresh AnalyzerEngine is built for every call, and this is called
+    # once per CSV cell, per JSON string, per text file. Engine construction
+    # loads the NLP models, so it dwarfs the cost of the analysis itself on
+    # a large file. I leave the shape as it is and name the cost here,
+    # because hoisting the engine is a design change, not a comment pass job.
+    # An analyzer failure also returns an empty list, which the caller reads
+    # as "no PII found": the text passes through unprocessed and the
+    # unprocessed count is not even incremented for it.
     analyzer = AnalyzerEngine()
     try:
         results = analyzer.analyze(text=text, entities=pii_types, language='en')
@@ -131,6 +139,11 @@ def anonymize_text(text, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_
     results = sorted(results, key=lambda x: x.start, reverse=True)
 
     for res in results:
+        # The 0.8 line is fixed in code, not an option. A detection under it
+        # stays in the output in the clear, by design: I would rather leave
+        # a doubtful value visible and counted than hash something that is
+        # probably not PII. The count at the end of main is the only summary
+        # a caller gets of how much was left behind this way.
         if res.score < 0.8:
             UNPROCESSED_COUNT += 1
             logging.warning(f"Skipped detection below the 0.8 threshold: type {res.entity_type}, score {res.score}. Value left unprocessed.")
@@ -150,6 +163,12 @@ def anonymize_text(text, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_
                 if hashed_value:
                     anonymized_text = anonymized_text[:start] + hashed_value + anonymized_text[end:]
                 else:
+                    # A failed hash leaves the original value sitting in
+                    # the text and the run carries on. bcrypt also refuses
+                    # or truncates inputs past 72 bytes depending on its
+                    # version, so a long detected span is exactly the kind
+                    # of value that can end up back here unhashed, with a
+                    # warning in the log as the only trace.
                     logging.warning(f"Failed to hash PII entity: {pii_entity}")
 
             elif replace_pii_flag:
@@ -184,6 +203,11 @@ def process_csv(input_file, output_file, fields, pii_types, hash_pii_flag, repla
 
         for field in fields:
             if field in df.columns:
+                # Every cell is stringified before it is analyzed, and the
+                # stringified frame is what gets written out: numbers lose
+                # their type, and an empty cell becomes the literal text
+                # nan in the output, because that is what str gives for a
+                # missing value in a column pandas read as floats.
                 df[field] = df[field].astype(str).apply(lambda x: anonymize_text(x, pii_types, hash_pii_flag, replace_pii_flag, keyed_hash_flag, hash_key))
             else:
                 logging.warning(f"Field '{field}' not found in CSV. Skipping.")
